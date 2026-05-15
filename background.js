@@ -9,19 +9,21 @@
 //   2. Read the current selection's range from the Name Box and derive
 //      header / data / column-strip sub-ranges.
 //   3. With the whole table selected (the user's selection):
-//        - All borders (Alt+Shift+7)
+//        - All borders (toolbar "枠線" → "すべての枠線" DOM click)
 //        - Create a filter (menu search: "Create a filter")
-//   4. With the table columns selected (URL #range rewrite):
-//        - Resize column → Fit to data
-//   5. With the data area selected (URL #range rewrite):
+//   4. With the data area selected (URL #range rewrite):
 //        - Wrap (menu search: "Wrap")
 //        - Horizontal left (Ctrl+Shift+L)
 //        - Vertical top (menu search: "Top")
-//   6. With the header row selected (URL #range rewrite):
+//   5. With the header row cells selected (URL #range rewrite):
 //        - Background gray (DOM click)
 //        - Text color white (DOM click)
 //        - Horizontal center (Ctrl+Shift+E)
 //        - Rotate up (menu search: "Rotate up")
+//   6. With the table columns selected (URL #range rewrite):
+//        - Resize column → Fit to data (runs AFTER wrap/rotate so column
+//          widths reflect the final wrapped/rotated state)
+//   7. With the header row selected as a whole row (1:1 form):
 //        - Resize row → Fit to data (header row height)
 
 const MODIFIERS = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
@@ -274,6 +276,9 @@ function deriveRanges(tableRange) {
     endRow,
     table: `${startCol}${startRow}:${endCol}${endRow}`,
     header: `${startCol}${startRow}:${endCol}${startRow}`,
+    // Whole-row form (e.g. "1:1") — Sheets exposes "Resize row" in the
+    // context menu only when a full row is selected, not for cell ranges.
+    headerRow: `${startRow}:${startRow}`,
     data: startRow < endRow ? `${startCol}${startRow + 1}:${endCol}${endRow}` : null,
     columns: `${startCol}:${endCol}`,
   };
@@ -407,6 +412,73 @@ async function dumpToolbarOverview(tabId) {
       hasShadowRoots: Array.from(document.querySelectorAll('*')).some((el) => el.shadowRoot),
       sampleLabels,
     };
+  });
+}
+
+// Diagnostic dump for the open Resize column/row dialog. Captures any
+// role=dialog containers plus small visible elements that could host the
+// "Fit to data" radio or OK button labels. Used to learn the actual DOM when
+// attribute-based lookups (findElementCenter) come up empty because the
+// labels live in textContent rather than aria-label / data-tooltip / title.
+async function dumpResizeDialog(tabId) {
+  return execInPage(tabId, () => {
+    const all = [];
+    const walk = (root) => {
+      const nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
+      for (const el of nodes) {
+        all.push(el);
+        if (el.shadowRoot) walk(el.shadowRoot);
+        if (el.tagName === 'IFRAME') {
+          try {
+            const idoc = el.contentDocument;
+            if (idoc) walk(idoc);
+          } catch (_) {}
+        }
+      }
+    };
+    walk(document);
+
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 ? r : null;
+    };
+
+    const dialogs = [];
+    for (const el of all) {
+      if (!el.getAttribute) continue;
+      const role = el.getAttribute('role');
+      if (role !== 'dialog' && role !== 'alertdialog') continue;
+      const r = visible(el);
+      if (!r) continue;
+      dialogs.push({
+        role,
+        ariaLabel: el.getAttribute('aria-label') || '',
+        ariaLabelledBy: el.getAttribute('aria-labelledby') || '',
+        className: (el.className || '').toString().slice(0, 160),
+        rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+        textPreview: (el.textContent || '').trim().slice(0, 240),
+      });
+    }
+
+    const items = [];
+    const seen = new Set();
+    for (const el of all) {
+      const r = visible(el);
+      if (!r) continue;
+      if (r.width > 600 || r.height > 80) continue;
+      const txt = (el.textContent || '').trim().slice(0, 80);
+      const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+      const role = (el.getAttribute && el.getAttribute('role')) || '';
+      const tag = el.tagName.toLowerCase();
+      if (!txt && !aria && !role) continue;
+      const key = `${tag}|${role}|${aria}|${txt}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ tag, role, aria, text: txt });
+      if (items.length >= 80) break;
+    }
+
+    return { dialogCount: dialogs.length, dialogs, items };
   });
 }
 
@@ -568,29 +640,173 @@ async function autoFitSelected(target, tabId, kind) {
   await mouseClickAt(target, item.x, item.y);
   await sleep(700);
 
-  const radioLabel = await waitForLabel(tabId, ['データに合わせる', 'Fit to data'], {
-    timeoutMs: 3000,
-  });
-  if (!radioLabel) {
-    console.warn(`[FormatTable] resize ${kind} dialog did not show "Fit to data" radio.`);
-    await pressKey(target, 'Escape', [], { after: 300 });
+  // Wait for the resize dialog to actually appear.
+  const dialogOpened = await waitForResizeDialogOpen(tabId, { timeoutMs: 3000 });
+  if (!dialogOpened) {
+    console.warn(`[FormatTable] resize ${kind} dialog did not open after clicking menu item.`);
     return;
   }
-  await clickFirstLabel(target, tabId, [radioLabel]);
+
+  // The dialog's controls (radio labels, OK button) expose their accessible
+  // names via textContent, so attribute-only lookups would miss them. Scope
+  // the search to the dialog container so "OK" can't accidentally match a
+  // toolbar element.
+  const radio = await findInDialog(tabId, ['データに合わせる', 'Fit to data']);
+  if (!radio) {
+    console.warn(`[FormatTable] resize ${kind}: "Fit to data" radio not found in dialog.`);
+    const dump = await dumpResizeDialog(tabId);
+    console.warn(`[FormatTable] resize ${kind} dialog DOM dump:`, dump);
+    // Don't risk pressing OK with the default radio selected — that would
+    // apply pixel-width and corrupt the columns. Cancel the dialog instead.
+    await closeResizeDialog(target, tabId, kind);
+    return;
+  }
+  console.log(`[FormatTable] resize ${kind}: selecting "${radio.label}"`);
+  await mouseClickAt(target, radio.x, radio.y);
   await sleep(250);
-  const ok = await clickFirstLabel(target, tabId, ['OK', 'Ok']);
-  if (!ok) await pressKey(target, 'Enter', [], { after: 600 });
-  await sleep(500);
+
+  await confirmResizeDialog(target, tabId, kind);
+  await sleep(400);
+
+  // Guarantee the dialog is gone — a lingering modal swallows the next
+  // phase's typed text (this is the bug we are fixing). Escalate: Enter
+  // (covers focus quirks), then Escape (cancels but at least frees the UI),
+  // then abort rather than let the next phase corrupt the sheet.
+  if (await waitForResizeDialogClosed(tabId, { timeoutMs: 2000 })) {
+    await sleep(400);
+    return;
+  }
+  console.warn(`[FormatTable] resize ${kind} dialog still open after OK; pressing Enter.`);
+  await pressKey(target, 'Enter', [], { after: 600 });
+  if (await waitForResizeDialogClosed(tabId, { timeoutMs: 1500 })) {
+    await sleep(400);
+    return;
+  }
+  console.warn(`[FormatTable] resize ${kind} dialog still open; sending Escape.`);
+  await pressKey(target, 'Escape', [], { after: 400 });
+  if (await waitForResizeDialogClosed(tabId, { timeoutMs: 1500 })) {
+    await sleep(400);
+    return;
+  }
+  throw new Error(`Resize ${kind} dialog could not be closed`);
 }
 
-async function waitForLabel(tabId, labels, { timeoutMs = 3000, intervalMs = 150 } = {}) {
+// Cancel an open resize dialog. Used when we can't safely confirm (e.g. the
+// "Fit to data" radio is not findable) — pressing OK in that state would
+// apply the default pixel width and overwrite the user's columns.
+async function closeResizeDialog(target, tabId, kind) {
+  await pressKey(target, 'Escape', [], { after: 400 });
+  if (await waitForResizeDialogClosed(tabId, { timeoutMs: 1500 })) return;
+  throw new Error(`Resize ${kind} dialog could not be closed (cancel path)`);
+}
+
+// Confirm the resize dialog: prefer clicking the OK button by text; fall back
+// to Enter (the dialog's default action) when OK is not findable.
+async function confirmResizeDialog(target, tabId, kind) {
+  const ok = await findInDialog(tabId, ['OK', 'Ok']);
+  if (!ok) {
+    console.warn(`[FormatTable] resize ${kind}: OK button not found; pressing Enter.`);
+    await pressKey(target, 'Enter', [], { after: 200 });
+    return;
+  }
+  console.log(`[FormatTable] resize ${kind}: clicking "${ok.label}"`);
+  await mouseClickAt(target, ok.x, ok.y);
+}
+
+// Returns true while a Sheets modal carrying the resize dialog text is
+// visible. Detection by textContent — the dialog title reads
+// e.g. "列 A - L のサイズを変更" / "Resize column" / "Resize row".
+async function isResizeDialogOpen(tabId) {
+  return execInPage(tabId, () => {
+    const dialogs = document.querySelectorAll('.modal-dialog, [role="dialog"]');
+    for (const d of dialogs) {
+      const r = d.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      const txt = d.textContent || '';
+      if (txt.includes('のサイズを変更') || /Resize (column|row)/.test(txt)) return true;
+    }
+    return false;
+  });
+}
+
+async function waitForResizeDialogOpen(tabId, { timeoutMs = 3000, intervalMs = 150 } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const hit = await findElementCenter(tabId, labels, { exact: true });
-    if (hit) return hit.label;
+    if (await isResizeDialogOpen(tabId)) return true;
     await sleep(intervalMs);
   }
-  return null;
+  return false;
+}
+
+async function waitForResizeDialogClosed(tabId, { timeoutMs = 3000, intervalMs = 150 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!(await isResizeDialogOpen(tabId))) return true;
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
+// Find a clickable element within the visible Sheets modal dialog by matching
+// trimmed textContent (preferred) or aria-label. Scoping to the dialog avoids
+// false positives on toolbar/menu items elsewhere on the page. Returns the
+// smallest matching element's center — typically the leaf label or button.
+async function findInDialog(tabId, texts) {
+  return execInPage(
+    tabId,
+    (list) => {
+      const dialogs = [];
+      for (const el of document.querySelectorAll('.modal-dialog, [role="dialog"]')) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) dialogs.push(el);
+      }
+      if (dialogs.length === 0) return null;
+      const all = [];
+      const walk = (root) => {
+        const nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (const el of nodes) {
+          all.push(el);
+          if (el.shadowRoot) walk(el.shadowRoot);
+        }
+      };
+      for (const d of dialogs) walk(d);
+
+      const pick = (predicate) => {
+        let best = null;
+        for (const el of all) {
+          if (!predicate(el)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const area = r.width * r.height;
+          if (!best || area < best.area) best = { el, r, area };
+        }
+        return best;
+      };
+
+      for (const want of list) {
+        const byText = pick((el) => (el.textContent || '').trim() === want);
+        if (byText) {
+          return {
+            x: byText.r.left + byText.r.width / 2,
+            y: byText.r.top + byText.r.height / 2,
+            label: want,
+          };
+        }
+        const byAria = pick(
+          (el) => el.getAttribute && el.getAttribute('aria-label') === want,
+        );
+        if (byAria) {
+          return {
+            x: byAria.r.left + byAria.r.width / 2,
+            y: byAria.r.top + byAria.r.height / 2,
+            label: want,
+          };
+        }
+      }
+      return null;
+    },
+    [texts],
+  );
 }
 
 async function run(tabId) {
@@ -619,8 +835,16 @@ async function run(tabId) {
 
     // 3. Whole-table phase — keep the user's Ctrl+A selection.
     await calmDown(target, tabId);
-    //   3a. All borders.
-    await pressKey(target, '7', ['alt', 'shift'], { after: 500 });
+    //   3a. All borders — drive the toolbar picker (Alt+Shift+7 silently
+    //   misses when the toolbar click that activated the extension stole
+    //   keyboard focus from the grid).
+    await applyPickerColor(
+      target,
+      tabId,
+      ['枠線', 'Borders'],
+      ['すべての枠線', '全ての枠線', 'All borders'],
+      ['枠線', '罫線', 'border', 'Border'],
+    );
     //   3b. Create a filter.
     await runMenuCommandAny(
       target,
@@ -629,28 +853,23 @@ async function run(tabId) {
       { after: 800 },
     );
 
-    // 4. Column-strip phase — auto-fit column widths via Shift+F10 context
-    //    menu (Sheets exposes "Resize column" only there).
-    await setSelectionViaHash(tabId, ranges.columns);
-    await sleep(600);
-    await autoFitSelected(target, tabId, 'column');
-
-    // 5. Data phase — wrap + left + top align (header gets neither wrap nor
-    //    these alignments).
+    // 4. Data phase — wrap + left + top align (header gets neither wrap nor
+    //    these alignments). Done BEFORE column auto-fit so that auto-fit
+    //    considers wrapped widths, matching a user's manual double-click.
     if (ranges.data) {
       await setSelectionViaHash(tabId, ranges.data);
       await sleep(600);
       await calmDown(target, tabId);
-      //   5a. Wrap text.
+      //   4a. Wrap text.
       await runMenuCommandAny(
         target,
         tabId,
         ['折り返し', 'Wrap'],
         { after: 700 },
       );
-      //   5b. Horizontal left.
+      //   4b. Horizontal left.
       await pressKey(target, 'l', ['ctrl', 'shift'], { after: 400 });
-      //   5c. Vertical top.
+      //   4c. Vertical top.
       await runMenuCommandAny(
         target,
         tabId,
@@ -659,23 +878,37 @@ async function run(tabId) {
       );
     }
 
-    // 6. Header phase.
+    // 5. Header phase — style + rotate (no auto-fit yet).
     await setSelectionViaHash(tabId, ranges.header);
     await sleep(600);
     await calmDown(target, tabId);
-    //   6a/b. Background / text colors.
+    //   5a/b. Background / text colors.
     await applyHeaderColors(target, tabId);
-    //   6c. Horizontal center.
+    //   5c. Horizontal center.
     await calmDown(target, tabId);
     await pressKey(target, 'e', ['ctrl', 'shift'], { after: 400 });
-    //   6d. Rotate up.
+    //   5d. Rotate up.
     await runMenuCommandAny(
       target,
       tabId,
       ['上向きに回転', 'Rotate up'],
       { after: 700 },
     );
-    //   6e. Auto-fit header row height so the rotated text isn't squished.
+
+    // 6. Column-strip phase — auto-fit column widths AFTER wrap + header
+    //    rotation so Sheets sizes columns based on the final wrapped/rotated
+    //    state. Earlier ordering produced very wide columns because auto-fit
+    //    saw the unwrapped longest cell content.
+    await setSelectionViaHash(tabId, ranges.columns);
+    await sleep(600);
+    await autoFitSelected(target, tabId, 'column');
+
+    // 7. Header row height — select the row as a full row (1:1), not a cell
+    //    range. Sheets exposes "Resize row" in the context menu only for
+    //    full-row selections; A1:L1 yields the cell context menu without
+    //    that item.
+    await setSelectionViaHash(tabId, ranges.headerRow);
+    await sleep(600);
     await autoFitSelected(target, tabId, 'row');
 
     console.log('[FormatTable] done.');
