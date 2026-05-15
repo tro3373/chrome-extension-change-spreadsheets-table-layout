@@ -1,24 +1,28 @@
 // Sheets Table Layout Formatter — MV3 service worker.
 //
-// Click the toolbar icon while the active cell sits inside a contiguous table.
-// The extension drives Google Sheets via chrome.debugger keyboard events plus
-// a few DOM hits for the color pickers, applying this fixed layout:
+// Select a contiguous table in Google Sheets first, then click the toolbar
+// icon. The extension drives Google Sheets via chrome.debugger keyboard events
+// plus a few DOM hits for the color pickers, applying this fixed layout:
 //
-//   1. Select the contiguous table (Ctrl+A).
-//   2. Read the resulting range from the Name Box and derive header / data /
-//      column-strip sub-ranges.
-//   3. With the whole table selected:
+//   1. (Disabled) Select the contiguous table (Ctrl+A). The user makes the
+//      selection themselves, so this step is commented out in run().
+//   2. Read the current selection's range from the Name Box and derive
+//      header / data / column-strip sub-ranges.
+//   3. With the whole table selected (the user's selection):
 //        - All borders (Alt+Shift+7)
 //        - Create a filter (menu search: "Create a filter")
-//   4. With the header row selected (URL #range rewrite):
+//   4. With the table columns selected (URL #range rewrite):
+//        - Resize column → Fit to data
+//   5. With the data area selected (URL #range rewrite):
+//        - Wrap (menu search: "Wrap")
+//        - Horizontal left (Ctrl+Shift+L)
+//        - Vertical top (menu search: "Top")
+//   6. With the header row selected (URL #range rewrite):
 //        - Background gray (DOM click)
 //        - Text color white (DOM click)
 //        - Horizontal center (Ctrl+Shift+E)
 //        - Rotate up (menu search: "Rotate up")
-//   5. With the table columns selected:
-//        - Resize column → Fit to data
-//   6. With the data area selected:
-//        - Wrap (menu search: "Wrap")
+//        - Resize row → Fit to data (header row height)
 
 const MODIFIERS = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
 
